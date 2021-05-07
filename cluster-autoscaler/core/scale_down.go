@@ -1201,7 +1201,13 @@ func drainNode(node *apiv1.Node, pods []*apiv1.Pod, daemonSetPods []*apiv1.Pod, 
 	retryUntil := time.Now().Add(maxPodEvictionTime)
 	confirmations := make(chan status.PodEvictionResult, len(pods))
 	daemonSetConfirmations := make(chan status.PodEvictionResult, len(daemonSetPods))
+
+	klog.V(2).Infof("Number of non-ds pods to evict: %d", len(pods))
+	klog.V(2).Infof("Number of ds pods to evict: %d", len(daemonSetPods))
+
+	// Evict "normal" pods first
 	for _, pod := range pods {
+		klog.V(2).Infof("Evicting pod %s", pod.Name)
 		evictionResults[pod.Name] = status.PodEvictionResult{Pod: pod, TimedOut: true, Err: nil}
 		go func(podToEvict *apiv1.Pod) {
 			confirmations <- evictPod(podToEvict, false, client, recorder, maxGracefulTerminationSec, retryUntil, waitBetweenRetries)
@@ -1209,15 +1215,16 @@ func drainNode(node *apiv1.Node, pods []*apiv1.Pod, daemonSetPods []*apiv1.Pod, 
 	}
 
 	// Perform eviction of daemonset. We don't want to raise an error if daemonsetPod wasn't evict properly
-	for _, daemonSetPod := range daemonSetPods {
-		go func(podToEvict *apiv1.Pod) {
-			daemonSetConfirmations <- evictPod(podToEvict, true, client, recorder, maxGracefulTerminationSec, retryUntil, waitBetweenRetries)
-		}(daemonSetPod)
-
-	}
+	// we'll do this later
+	// for _, daemonSetPod := range daemonSetPods {
+	// 	go func(podToEvict *apiv1.Pod) {
+	// 		daemonSetConfirmations <- evictPod(podToEvict, true, client, recorder, maxGracefulTerminationSec, retryUntil, waitBetweenRetries)
+	// 	}(daemonSetPod)
+	//
+	// }
 
 	podsEvictionCounter := 0
-	for i := 0; i < len(pods)+len(daemonSetPods); i++ {
+	for i := 0; i < len(pods); i++ {
 		select {
 		case evictionResult := <-confirmations:
 			podsEvictionCounter++
@@ -1225,13 +1232,13 @@ func drainNode(node *apiv1.Node, pods []*apiv1.Pod, daemonSetPods []*apiv1.Pod, 
 			if evictionResult.WasEvictionSuccessful() {
 				metrics.RegisterEvictions(1)
 			}
-		case <-daemonSetConfirmations:
+		// case <-daemonSetConfirmations:
 		case <-time.After(retryUntil.Sub(time.Now()) + 5*time.Second):
 			if podsEvictionCounter < len(pods) {
 				// All pods initially had results with TimedOut set to true, so the ones that didn't receive an actual result are correctly marked as timed out.
 				return evictionResults, errors.NewAutoscalerError(errors.ApiCallError, "Failed to drain node %s/%s: timeout when waiting for creating evictions", node.Namespace, node.Name)
 			}
-			klog.Infof("Timeout when waiting for creating daemonSetPods eviction")
+			// klog.Infof("Timeout when waiting for creating daemonSetPods eviction")
 		}
 	}
 
@@ -1264,6 +1271,25 @@ func drainNode(node *apiv1.Node, pods []*apiv1.Pod, daemonSetPods []*apiv1.Pod, 
 		}
 		if allGone {
 			klog.V(1).Infof("All pods removed from %s", node.Name)
+			// Now evict daemonset pods
+			// same code from above, but short grace period
+			dsMaxGracefulTerminationSec := 10
+			dsRetryUntil := time.Now().Add(10 * time.Second)
+			for _, daemonSetPod := range daemonSetPods {
+				klog.V(2).Infof("Evicting ds pod %s", daemonSetPod.Name)
+				go func(podToEvict *apiv1.Pod) {
+					daemonSetConfirmations <- evictPod(podToEvict, true, client, recorder, dsMaxGracefulTerminationSec, dsRetryUntil, waitBetweenRetries)
+				}(daemonSetPod)
+			}
+
+			for i := 0; i < len(daemonSetPods); i++ {
+				select {
+				case <-daemonSetConfirmations:
+				case <-time.After(retryUntil.Sub(time.Now()) + 5*time.Second):
+					klog.Infof("Timeout when waiting for creating daemonSetPods eviction")
+				}
+			}
+
 			// Let the deferred function know there is no need for cleanup
 			return evictionResults, nil
 		}
